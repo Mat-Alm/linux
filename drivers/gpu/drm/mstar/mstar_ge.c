@@ -377,7 +377,7 @@ static int mstar_ge_do_line(struct mstar_ge *ge,
 		regcache_cache_only(ge->regmap, false);
 	}
 
-	dev_info(ge->dev, "doing line draw from %d,%d to %d,%d (area %d x %d, length %d, delta %x, ymajor %d), free %d\n",
+	dev_dbg(ge->dev, "doing line draw from %d,%d to %d,%d (area %d x %d, length %d, delta %x, ymajor %d), free %d\n",
 			x0, y0, x1, y1,
 			w, h, length, delta, ymajor,
 			mstar_ge_cmq_free(ge));
