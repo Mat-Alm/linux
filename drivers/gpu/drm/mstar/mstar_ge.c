@@ -10,6 +10,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 
@@ -201,7 +202,9 @@ struct mstar_ge {
 
 	struct regmap_field *b_st, *g_st, *r_st, *a_st;
 
+	spinlock_t lock;
 	struct list_head queue;
+	int inflight;
 
 	struct miscdevice ge_dev;
 
@@ -561,22 +564,27 @@ static void mstar_ge_read_p256(struct mstar_ge *ge)
 	}
 }
 
-static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
+static int mstar_ge_run_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 {
-	int src_fmt;
 	int dst_fmt = mstar_ge_drm_color_to_gop(job->dst_cfg.fourcc);
+	struct device *dev = ge->dev;
+	int src_fmt;
+	int ret;
 
-	/* dst is mandatory */
-	if (!job->dst_addr)
-		return -EINVAL;
-
-	list_add_tail(&job->queue, &ge->queue);
+	ret = pm_runtime_get_sync(dev);
+	if (ret < 0) {
+		dev_err(dev, "runtime resume failed %d\n", ret);
+		pm_runtime_put_noidle(dev);
+		return ret;
+	}
 
 	/* src is optional for some ops*/
 	if (job->src_addr) {
 		src_fmt = mstar_ge_drm_color_to_gop(job->src_cfg.fourcc);
-		if (src_fmt < 0)
-			return src_fmt;
+		if (src_fmt < 0) {
+			ret = src_fmt;
+			goto abort;
+		}
 
 		dev_dbg(ge->dev, "Setting source %d x %d (%d)\n",
 				job->src_cfg.width, job->src_cfg.height, job->src_cfg.pitch);
@@ -587,15 +595,18 @@ static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 		case MSTAR_GE_OP_BITBLT:
 		case MSTAR_GE_OP_STRBLT:
 			dev_err(ge->dev, "Blit operations require two buffers\n");
-			return -EINVAL;
+			ret = -EINVAL;
+			goto abort;
 		default:
 			break;
 		}
 	}
 
 	/* dst is required */
-	if (dst_fmt < 0)
-		return dst_fmt;
+	if (dst_fmt < 0) {
+		ret = dst_fmt;
+		goto abort;
+	}
 
 	dev_dbg(ge->dev, "Setting destination %d x %d (%d)\n",
 			job->dst_cfg.width, job->dst_cfg.height, job->dst_cfg.pitch);
@@ -652,14 +663,40 @@ static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 				   &job->opdata.strblt);
 		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
+		goto abort;
 	}
 
 	if (!wait_event_timeout(job->dma_wait, job->dma_done, HZ * 10)) {
 		dev_err(ge->dev, "timeout waiting for dma to finish\n");
 	}
 
-	return 0;
+abort:
+	pm_runtime_put(dev);
+
+	return ret;
+}
+
+static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	/* dst is mandatory */
+	if (!job->dst_addr)
+		return -EINVAL;
+
+	spin_lock_irqsave(&ge->lock, flags);
+	ge->inflight++;
+	list_add_tail(&job->queue, &ge->queue);
+
+	/* Start the first job */
+	if (ge->inflight == 1)
+		ret = mstar_ge_run_job(ge, job);
+
+	spin_unlock_irqrestore(&ge->lock, flags);
+
+	return ret;
 }
 
 static irqreturn_t mstar_ge_irq(int irq, void *data)
@@ -667,10 +704,11 @@ static irqreturn_t mstar_ge_irq(int irq, void *data)
 	struct mstar_ge *ge = data;
 	struct mstar_ge_job *job;
 	unsigned int status;
+	unsigned long flags;
+	int ret = IRQ_HANDLED;
 
 	regmap_field_read(ge->irq_status, &status);
 	regmap_field_write(ge->irq_force, 0);
-
 
 	/*
 	 * To clear the irq the clear bits need to be
@@ -683,18 +721,25 @@ static irqreturn_t mstar_ge_irq(int irq, void *data)
 
 	dev_dbg(ge->dev, "interrupt, %x\n", status);
 
-	if (list_empty(&ge->queue)) {
+	spin_lock_irqsave(&ge->lock, flags);
+
+	if (!ge->inflight) {
 		dev_err(ge->dev, "Interrupt when no jobs queued!\n");
-		return IRQ_NONE;
+		ret = IRQ_NONE;
+		goto out;
 	}
 
 	job = list_first_entry(&ge->queue, struct mstar_ge_job, queue);
 	job->dma_done = true;
 	list_del(&job->queue);
+	ge->inflight--;
 
 	wake_up(&job->dma_wait);
 
-	return IRQ_HANDLED;
+out:
+	spin_unlock_irqrestore(&ge->lock, flags);
+
+	return ret;
 }
 
 static void mstar_ge_filltestbuf(const struct mstar_ge_buf *buf)
@@ -1077,6 +1122,58 @@ free_job:
 	return ret;
 }
 
+static int mstar_ge_validate_buffer(struct mstar_ge *ge, struct mstar_ge_buf *buf, int number)
+{
+	dev_dbg(ge->dev, "buffer: %d, fd %d %dpx x %dpx, pitch %d, format %p4cc\n",
+			 number, buf->fd, buf->cfg.width, buf->cfg.height, buf->cfg.pitch,
+			 &buf->cfg.fourcc);
+
+	if (buf->fd < 0)
+		return -EINVAL;
+
+	if (mstar_ge_drm_color_to_gop(buf->cfg.fourcc) < 0) {
+		dev_warn(ge->dev, "Unhandled buffer type\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int mstar_ge_validate_op(struct mstar_ge *ge, struct mstar_ge_opdata *op, int number)
+{
+	/* Check the operation isn't garbage */
+	switch (op->op) {
+	case MSTAR_GE_OP_LINE:
+		dev_dbg(ge->dev, "op %d: LINE\n", number);
+		break;
+	case MSTAR_GE_OP_RECTFILL:
+		dev_dbg(ge->dev, "op %d: RECTFILL, %d:%d -> %d:%d\n",
+				number,
+				op->rectfill.x0, op->rectfill.y0,
+				op->rectfill.x1, op->rectfill.y1);
+		break;
+	case MSTAR_GE_OP_BITBLT:
+		dev_dbg(ge->dev, "op %d: BITBLT %d,%d -> %d:%d,%d,%d (rot %d)\n", number,
+				op->bitblt.src_x0, op->bitblt.src_y0,
+				op->bitblt.dst_x0, op->bitblt.dst_y0,
+				op->bitblt.dst_x1, op->bitblt.dst_y1,
+				op->bitblt.rotation);
+		break;
+	case MSTAR_GE_OP_STRBLT:
+		dev_dbg(ge->dev, "op %d: STRBLT %d,%d,%d,%d -> %d:%d,%d,%d (rot %d)\n", number,
+				  op->strblt.src_x0, op->strblt.src_y0,
+				  op->strblt.src_x1, op->strblt.src_y1,
+				  op->strblt.dst_x0, op->strblt.dst_y0,
+				  op->strblt.dst_x1, op->strblt.dst_y1,
+				  op->strblt.rotation);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 {
 	struct mstar_ge_job_request req;
@@ -1134,22 +1231,13 @@ static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 	/* Check all the buffers are sane */
 	for (i = 0; i < req.num_bufs; i++) {
 		struct mstar_ge_buf *buf = &bufs[i];
-		dev_dbg(ge->dev, "buffer %d: fd %d %dpx x %dpx, pitch %d, format %p4cc\n",
-			 i, buf->fd, buf->cfg.width, buf->cfg.height, buf->cfg.pitch,
-			 &buf->cfg.fourcc);
-
-		if (buf->fd < 0) {
-			ret = -EINVAL;
-			goto free_ops;
-		}
-
-		if (mstar_ge_drm_color_to_gop(buf->cfg.fourcc) < 0) {
-			dev_warn(ge->dev, "Unhandled buffer type\n");
-			ret = -EINVAL;
+		if (mstar_ge_validate_buffer(ge, buf, i)) {
+			ret = -EFAULT;
 			goto free_ops;
 		}
 	}
 
+	/* Figure out the DMA directions */
 	if (req.num_bufs == 1)
 		dma_dirs[0] = DMA_FROM_DEVICE;
 	else {
@@ -1185,33 +1273,8 @@ static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 
 	for (i = 0; i < req.num_ops; i++) {
 		struct mstar_ge_opdata *op = &ops[i];
-		/* Check the operation isn't garbage */
-		switch (op->op) {
-		case MSTAR_GE_OP_LINE:
-			dev_dbg(ge->dev, "op %d: LINE\n", i);
-			break;
-		case MSTAR_GE_OP_RECTFILL:
-			dev_dbg(ge->dev, "op %d: RECTFILL, %d:%d -> %d:%d\n",
-					i,
-					op->rectfill.x0, op->rectfill.y0,
-					op->rectfill.x1, op->rectfill.y1);
-			break;
-		case MSTAR_GE_OP_BITBLT:
-			dev_dbg(ge->dev, "op %d: BITBLT %d,%d -> %d:%d,%d,%d (rot %d)\n", i,
-					op->bitblt.src_x0, op->bitblt.src_y0,
-					op->bitblt.dst_x0, op->bitblt.dst_y0,
-					op->bitblt.dst_x1, op->bitblt.dst_y1,
-					op->bitblt.rotation);
-			break;
-		case MSTAR_GE_OP_STRBLT:
-			dev_dbg(ge->dev, "op %d: STRBLT %d,%d,%d,%d -> %d:%d,%d,%d (rot %d)\n", i,
-					  op->strblt.src_x0, op->strblt.src_y0,
-					  op->strblt.src_x1, op->strblt.src_y1,
-					  op->strblt.dst_x0, op->strblt.dst_y0,
-					  op->strblt.dst_x1, op->strblt.dst_y1,
-					  op->strblt.rotation);
-			break;
-		default:
+
+		if (mstar_ge_validate_op(ge, op, i)) {
 			ret = -EFAULT;
 			goto free_ops;
 		}
@@ -1311,6 +1374,7 @@ static int mstar_ge_probe(struct platform_device *pdev)
 	if (!ge->jobs)
 		return -ENOMEM;
 
+	spin_lock_init(&ge->lock);
 	INIT_LIST_HEAD(&ge->queue);
 
 	ge->dev = dev;
@@ -1431,6 +1495,8 @@ static int mstar_ge_probe(struct platform_device *pdev)
 	ge->ge_dev.name	= DRIVER_NAME;
 	ge->ge_dev.fops	= &ge_fops;
 
+	pm_runtime_enable(dev);
+
 	return misc_register(&ge->ge_dev);
 }
 
@@ -1438,6 +1504,8 @@ static int mstar_ge_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct mstar_ge *ge = dev_get_drvdata(dev);
+
+	pm_runtime_force_suspend(dev);
 
 	misc_deregister(&ge->ge_dev);
 
@@ -1454,12 +1522,32 @@ static const struct of_device_id mstar_ge_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, mstar_ge_ids);
 
+static int __maybe_unused mstar_ge_runtime_suspend(struct device *dev)
+{
+	//struct msc313e_i2c *i2c = dev_get_drvdata(dev);
+
+	return 0;
+}
+
+static int __maybe_unused mstar_ge_runtime_resume(struct device *dev)
+{
+	//struct msc313e_i2c *i2c = dev_get_drvdata(dev);
+	//long clk_rate;
+
+	return 0;
+};
+
+static const struct dev_pm_ops mstar_ge_pm = {
+	SET_RUNTIME_PM_OPS(mstar_ge_runtime_suspend, mstar_ge_runtime_resume, NULL)
+};
+
 static struct platform_driver mstar_ge_driver = {
 	.probe = mstar_ge_probe,
 	.remove = mstar_ge_remove,
 	.driver = {
 		.name = DRIVER_NAME,
 		.of_match_table = mstar_ge_ids,
+		.pm = &mstar_ge_pm,
 	},
 };
 module_platform_driver(mstar_ge_driver);
