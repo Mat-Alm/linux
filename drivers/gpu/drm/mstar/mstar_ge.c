@@ -575,7 +575,7 @@ static int mstar_ge_run_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 	if (ret < 0) {
 		dev_err(dev, "runtime resume failed %d\n", ret);
 		pm_runtime_put_noidle(dev);
-		return ret;
+		goto abort_pm_get;
 	}
 
 	/* src is optional for some ops*/
@@ -667,13 +667,12 @@ static int mstar_ge_run_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 		goto abort;
 	}
 
-	if (!wait_event_timeout(job->dma_wait, job->dma_done, HZ * 10)) {
-		dev_err(ge->dev, "timeout waiting for dma to finish\n");
-	}
+	return 0;
 
 abort:
 	pm_runtime_put(dev);
-
+abort_pm_get:
+	ge->inflight--;
 	return ret;
 }
 
@@ -696,12 +695,18 @@ static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 
 	spin_unlock_irqrestore(&ge->lock, flags);
 
+	// fixme!
+	if (!wait_event_timeout(job->dma_wait, job->dma_done, HZ * 10)) {
+		dev_err(ge->dev, "timeout waiting for dma to finish\n");
+	}
+
 	return ret;
 }
 
 static irqreturn_t mstar_ge_irq(int irq, void *data)
 {
 	struct mstar_ge *ge = data;
+	struct device *dev = ge->dev;
 	struct mstar_ge_job *job;
 	unsigned int status;
 	unsigned long flags;
@@ -719,22 +724,32 @@ static irqreturn_t mstar_ge_irq(int irq, void *data)
 	regmap_field_force_write(ge->irq_clr, ~0);
 	regmap_field_force_write(ge->irq_clr, 0);
 
-	dev_dbg(ge->dev, "interrupt, %x\n", status);
+	dev_dbg(dev, "interrupt, %x\n", status);
 
 	spin_lock_irqsave(&ge->lock, flags);
 
 	if (!ge->inflight) {
-		dev_err(ge->dev, "Interrupt when no jobs queued!\n");
+		dev_err(dev, "Interrupt when no jobs queued!\n");
 		ret = IRQ_NONE;
 		goto out;
 	}
 
+	/* free the finished job */
 	job = list_first_entry(&ge->queue, struct mstar_ge_job, queue);
 	job->dma_done = true;
 	list_del(&job->queue);
 	ge->inflight--;
 
 	wake_up(&job->dma_wait);
+
+	/* run next job */
+	if (ge->inflight) {
+		job = list_first_entry(&ge->queue, struct mstar_ge_job, queue);
+		mstar_ge_run_job(ge, job);
+	}
+
+	/* decrement the pm runtime counter */
+	pm_runtime_put(dev);
 
 out:
 	spin_unlock_irqrestore(&ge->lock, flags);
@@ -1484,6 +1499,9 @@ static int mstar_ge_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(dev, ge);
 
+	/* pm runtime must be enabled before self testing */
+	pm_runtime_enable(dev);
+
 	if (IS_ENABLED(CONFIG_DRM_MSTAR_GE_SELFTEST)) {
 		int testret = mstar_ge_test(ge);
 
@@ -1491,11 +1509,10 @@ static int mstar_ge_probe(struct platform_device *pdev)
 			dev_err(dev, "Self test failed: %d\n", testret);
 	}
 
+	/* Finally register the misc device so userspace can use this */
 	ge->ge_dev.minor = MISC_DYNAMIC_MINOR;
 	ge->ge_dev.name	= DRIVER_NAME;
 	ge->ge_dev.fops	= &ge_fops;
-
-	pm_runtime_enable(dev);
 
 	return misc_register(&ge->ge_dev);
 }
