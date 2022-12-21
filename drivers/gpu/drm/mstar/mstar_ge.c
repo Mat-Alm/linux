@@ -1223,6 +1223,12 @@ static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 		return -EINVAL;
 	}
 
+	/* There is a limit to how many jobs can be queued at once */
+	if (req.num_ops > MSTAR_GE_MAX_JOBS) {
+		dev_err(ge->dev, "Tried to queue too many jobs\n");
+		return -EINVAL;
+	}
+
 	/* For now we either need 1 or 2 buffers */
 	if (req.num_bufs <= 0 || req.num_bufs > 2) {
 		dev_err(ge->dev, "Invalid amount of buffers in request: %d\n",
