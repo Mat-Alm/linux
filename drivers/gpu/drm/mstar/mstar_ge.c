@@ -205,6 +205,7 @@ struct mstar_ge {
 	spinlock_t lock;
 	struct list_head queue;
 	int inflight;
+	wait_queue_head_t dma_wait;
 
 	struct miscdevice ge_dev;
 
@@ -259,7 +260,7 @@ struct mstar_ge_job {
 	struct mstar_ge_dma_buf src_dma_buf, dst_dma_buf;
 
 	struct list_head queue;
-	wait_queue_head_t dma_wait;
+
 	bool dma_done;
 };
 
@@ -268,7 +269,6 @@ static inline void mstar_ge_job_init(void *job)
 	struct mstar_ge_job *ge_job = job;
 
 	INIT_LIST_HEAD(&ge_job->queue);
-	init_waitqueue_head(&ge_job->dma_wait);
 }
 
 static int mstar_ge_cmq_free(struct mstar_ge *ge)
@@ -676,6 +676,13 @@ abort_pm_get:
 	return ret;
 }
 
+static void mstar_ge_wait_for_idle(struct mstar_ge *ge)
+{
+	if (!wait_event_timeout(ge->dma_wait, ge->inflight == 0, HZ * 10)) {
+		dev_err(ge->dev, "timeout waiting for jobs to finish\n");
+	}
+}
+
 static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 {
 	unsigned long flags;
@@ -695,10 +702,7 @@ static int mstar_ge_queue_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 
 	spin_unlock_irqrestore(&ge->lock, flags);
 
-	// fixme!
-	if (!wait_event_timeout(job->dma_wait, job->dma_done, HZ * 10)) {
-		dev_err(ge->dev, "timeout waiting for dma to finish\n");
-	}
+
 
 	return ret;
 }
@@ -740,8 +744,6 @@ static irqreturn_t mstar_ge_irq(int irq, void *data)
 	list_del(&job->queue);
 	ge->inflight--;
 
-	wake_up(&job->dma_wait);
-
 	/* run next job */
 	if (ge->inflight) {
 		job = list_first_entry(&ge->queue, struct mstar_ge_job, queue);
@@ -751,6 +753,7 @@ static irqreturn_t mstar_ge_irq(int irq, void *data)
 	/* decrement the pm runtime counter */
 	pm_runtime_put(dev);
 
+	wake_up(&ge->dma_wait);
 out:
 	spin_unlock_irqrestore(&ge->lock, flags);
 
@@ -873,6 +876,8 @@ static void mstar_ge_test_posttest(
 		void *src_alloc, void *dst_alloc)
 {
 	int i;
+
+	mstar_ge_wait_for_idle(ge);
 
 	mstar_ge_test_unmapbuffers(ge, j, src, dst);
 
@@ -1194,7 +1199,7 @@ static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 	struct mstar_ge_job_request req;
 	struct mstar_ge_opdata *ops;
 	struct mstar_ge_buf bufs[2];
-	struct mstar_ge_job *job;
+	struct mstar_ge_job *jobs[MSTAR_GE_MAX_JOBS];
 	enum dma_data_direction dma_dirs[2];
 	struct dma_buf *dma_bufs[2];
 	struct dma_buf_attachment *dma_attachs[2];
@@ -1288,6 +1293,7 @@ static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 
 	for (i = 0; i < req.num_ops; i++) {
 		struct mstar_ge_opdata *op = &ops[i];
+		struct mstar_ge_job *job;
 
 		if (mstar_ge_validate_op(ge, op, i)) {
 			ret = -EFAULT;
@@ -1315,8 +1321,15 @@ static long mstar_ge_ioctl_queue(struct mstar_ge *ge, unsigned long arg)
 		}
 
 		dev_dbg(ge->dev, "Queuing job for op %d\n", i);
+		jobs[i] = job;
 		mstar_ge_queue_job(ge, job);
-		kmem_cache_free(ge->jobs, job);
+	}
+
+	/* wait for everything to finish */
+	mstar_ge_wait_for_idle(ge);
+
+	for (i = 0; i < req.num_ops; i++) {
+		kmem_cache_free(ge->jobs, jobs[i]);
 	}
 
 	/* unmap everything, this needs to move once things are actually async */
@@ -1391,6 +1404,7 @@ static int mstar_ge_probe(struct platform_device *pdev)
 
 	spin_lock_init(&ge->lock);
 	INIT_LIST_HEAD(&ge->queue);
+	init_waitqueue_head(&ge->dma_wait);
 
 	ge->dev = dev;
 

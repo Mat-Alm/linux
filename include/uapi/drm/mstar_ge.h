@@ -109,6 +109,8 @@ struct mstar_ge_opdata {
 	};
 };
 
+#define MSTAR_GE_MAX_JOBS	32
+
 struct mstar_ge_job_request {
 	/*
 	 * Address to write the job tag into.
