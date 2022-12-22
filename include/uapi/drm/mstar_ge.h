@@ -56,6 +56,15 @@ struct mstar_ge_rectfill_params {
 	struct mstar_ge_color start_color;
 };
 
+struct mstar_ge_blt_fliprot {
+	/* src v flip */
+	bool src_v_flip;
+	/* dst flip */
+	bool dst_h_flip, dst_v_flip;
+	/* rotation to apply */
+	enum mstar_ge_rotation rotation;
+};
+
 /* Extra parameters for a BITBLT */
 struct mstar_ge_bitblt {
 	/* top left corner of the src */
@@ -64,8 +73,8 @@ struct mstar_ge_bitblt {
 	unsigned int dst_x0, dst_y0;
 	/* bottom right corner of the src */
 	unsigned int dst_x1, dst_y1;
-	/* rotation to apply */
-	enum mstar_ge_rotation rotation;
+
+	struct mstar_ge_blt_fliprot fliprot;
 };
 
 /* Extra parameters for a STRBLT */
@@ -78,8 +87,8 @@ struct mstar_ge_strblt {
 	unsigned int dst_x0, dst_y0;
 	/* bottom right corner of the src */
 	unsigned int dst_x1, dst_y1;
-	/* rotation to apply */
-	enum mstar_ge_rotation rotation;
+
+	struct mstar_ge_blt_fliprot fliprot;
 };
 
 struct mstar_ge_buf_cfg {

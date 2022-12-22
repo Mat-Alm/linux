@@ -123,7 +123,9 @@ static const struct reg_field prim_type_field = REG_FIELD(REG_CMD, 4, 6);
 #define PRIM_TYPE_BITBLT	4
 #define PRIM_TYPE_FREEZE	7
 
+static const struct reg_field pri_s_y_dir_field = REG_FIELD(REG_CMD, 8, 8);
 static const struct reg_field pri_x_dir_field = REG_FIELD(REG_CMD, 9, 9);
+static const struct reg_field pri_y_dir_field = REG_FIELD(REG_CMD, 10, 10);
 
 /* s1.12 */
 static const struct reg_field line_delta_field = REG_FIELD(REG_LINE_CTRL0, 1, 14);
@@ -185,7 +187,7 @@ struct mstar_ge {
 	struct regmap_field *srcclrfmt, *dstclrfmt;
 	struct regmap_field *clip_left, *clip_right, *clip_top, *clip_bottom;
 	struct regmap_field *rot;
-	struct regmap_field *prim_type, *pri_x_dir;
+	struct regmap_field *prim_type, *pri_s_y_dir, *pri_x_dir, *pri_y_dir;
 	struct regmap_field *line_delta, *line_major, *line_last, *line_length;
 	struct regmap_field *x0, *y0, *x1, *y1, *x2, *y2;
 
@@ -434,6 +436,17 @@ static int mstar_ge_drm_color_to_gop(u32 fourcc)
 static int mstar_ge_do_bitblt(struct mstar_ge *ge, unsigned int width,
 		unsigned int height, struct mstar_ge_bitblt *bitblt)
 {
+	/* For source flipping */
+	unsigned int src_x0 = bitblt->src_x0;
+	unsigned int dst_w = bitblt->dst_x1 - bitblt->dst_x0;
+	unsigned int src_y0 = bitblt->src_y0;
+	unsigned int dst_h = bitblt->dst_y1 - bitblt->dst_y0;
+	/* For dest flipping/rotation */
+	unsigned int dst_x0;
+	unsigned int dst_x1;
+	unsigned int dst_y0;
+	unsigned int dst_y1;
+
 	dev_dbg(ge->dev, "doing bitblt %d, %d -> %d:%d,%d:%d free %d\n",
 			bitblt->src_x0, bitblt->src_y0,
 			bitblt->dst_x0, bitblt->dst_y0,
@@ -448,13 +461,15 @@ static int mstar_ge_do_bitblt(struct mstar_ge *ge, unsigned int width,
 	regmap_field_write(ge->bitblt_src_width, width);
 	regmap_field_write(ge->bitblt_src_height, height);
 
-	regmap_field_write(ge->rot, bitblt->rotation);
+	regmap_field_write(ge->rot, bitblt->fliprot.rotation);
 
 	/* set the region to copy to */
-	switch(bitblt->rotation) {
+	switch(bitblt->fliprot.rotation) {
 		case MSTAR_GE_ROTATION_0:
-			mstar_ge_set_priv0(ge, bitblt->dst_x0, bitblt->dst_y0);
-			mstar_ge_set_priv1(ge, bitblt->dst_x1, bitblt->dst_y1);
+			dst_x0 = bitblt->dst_x0;
+			dst_y0 = bitblt->dst_y0;
+			dst_x1 = bitblt->dst_x1;
+			dst_y1 = bitblt->dst_y1;
 			break;
 		case MSTAR_GE_ROTATION_90:
 			mstar_ge_set_priv0(ge, bitblt->dst_x1, bitblt->dst_y0);
@@ -470,8 +485,28 @@ static int mstar_ge_do_bitblt(struct mstar_ge *ge, unsigned int width,
 			break;
 	}
 
-	/* set the top left corner of the source */
-	mstar_ge_set_priv2(ge, bitblt->src_x0, bitblt->src_y0);
+	regcache_cache_only(ge->regmap, true);
+	if (bitblt->fliprot.dst_h_flip) {
+		regmap_field_write(ge->pri_x_dir, 1);
+		swap(dst_x0, dst_x1);
+	}
+	if (bitblt->fliprot.dst_v_flip) {
+		regmap_field_write(ge->pri_y_dir, 1);
+		swap(dst_y0, dst_y1);
+	}
+	if (bitblt->fliprot.dst_h_flip) {
+		regmap_field_write(ge->pri_s_y_dir, 1);
+		/* with vertical src flipping the start point is the bottom corner */
+		src_y0 += dst_h;
+	}
+	regcache_cache_only(ge->regmap, false);
+
+	/* set the destination area */
+	mstar_ge_set_priv0(ge, dst_x0, dst_y0);
+	mstar_ge_set_priv1(ge, dst_x1, dst_y1);
+
+	/* set the start corner of the source */
+	mstar_ge_set_priv2(ge, src_x0, src_y0);
 
 	regmap_field_force_write(ge->prim_type, PRIM_TYPE_BITBLT);
 
@@ -512,10 +547,10 @@ static int mstar_ge_do_strblt(struct mstar_ge *ge, unsigned int width,
 	regmap_field_write(ge->bitblt_src_width, width);
 	regmap_field_write(ge->bitblt_src_height, height);
 
-	regmap_field_write(ge->rot, strblt->rotation);
+	regmap_field_write(ge->rot, strblt->fliprot.rotation);
 
 	/* set the region to copy to */
-	switch(strblt->rotation) {
+	switch(strblt->fliprot.rotation) {
 		case MSTAR_GE_ROTATION_0:
 			mstar_ge_set_priv0(ge, strblt->dst_x0, strblt->dst_y0);
 			mstar_ge_set_priv1(ge, strblt->dst_x1, strblt->dst_y1);
@@ -623,7 +658,9 @@ static int mstar_ge_run_job(struct mstar_ge *ge, struct mstar_ge_job *job)
 
 	/* reset the pri x dir, but don't actually write the register.. */
 	regcache_cache_only(ge->regmap, true);
+	regmap_field_write(ge->pri_s_y_dir, 0);
 	regmap_field_write(ge->pri_x_dir, 0);
+	regmap_field_write(ge->pri_y_dir, 0);
 	regcache_cache_only(ge->regmap, false);
 
 	regmap_field_write(ge->rot, 0);
@@ -762,10 +799,18 @@ out:
 
 static void mstar_ge_filltestbuf(const struct mstar_ge_buf *buf)
 {
-	u32 i;
+	u32 i, j, y;
+	int bytesperpixel = buf->cfg.pitch / buf->cfg.width;
 
-	for(i = 0; i < buf->cfg.height; i++)
-		memset(buf->buf + (buf->cfg.pitch * i), ~i & 0xff, buf->cfg.pitch);
+	for(i = 0; i < buf->cfg.height; i++) {
+		void *line = buf->buf + (buf->cfg.pitch * i);
+		for (j = 0; j < buf->cfg.width; j++) {
+			u8 *pixel = line + (bytesperpixel * j);
+			for (y = 0; y < bytesperpixel; y++)
+				/* Should give a pattern of ~row, col */
+				pixel[y] = y % 2 ? j : ~i;
+		}
+	}
 }
 
 static void mstar_ge_cleartestbuf(const struct mstar_ge_buf *buf)
@@ -855,11 +900,48 @@ static void mstar_ge_test_unmapbuffers(const struct mstar_ge *ge,
 	mstar_ge_unmap_kalloc(ge, j->dst_addr, dst, DMA_FROM_DEVICE);
 }
 
+static int mstar_ge_validate_op(struct mstar_ge *ge, struct mstar_ge_opdata *op, int number)
+{
+	/* Check the operation isn't garbage */
+	switch (op->op) {
+	case MSTAR_GE_OP_LINE:
+		dev_dbg(ge->dev, "op %d: LINE\n", number);
+		break;
+	case MSTAR_GE_OP_RECTFILL:
+		dev_dbg(ge->dev, "op %d: RECTFILL, %d:%d -> %d:%d\n",
+				number,
+				op->rectfill.x0, op->rectfill.y0,
+				op->rectfill.x1, op->rectfill.y1);
+		break;
+	case MSTAR_GE_OP_BITBLT:
+		dev_info(ge->dev, "op %d: BITBLT %d,%d -> %d:%d,%d,%d (rot %d)\n", number,
+				op->bitblt.src_x0, op->bitblt.src_y0,
+				op->bitblt.dst_x0, op->bitblt.dst_y0,
+				op->bitblt.dst_x1, op->bitblt.dst_y1,
+				op->bitblt.fliprot.rotation);
+		break;
+	case MSTAR_GE_OP_STRBLT:
+		dev_dbg(ge->dev, "op %d: STRBLT %d,%d,%d,%d -> %d:%d,%d,%d (rot %d)\n", number,
+				  op->strblt.src_x0, op->strblt.src_y0,
+				  op->strblt.src_x1, op->strblt.src_y1,
+				  op->strblt.dst_x0, op->strblt.dst_y0,
+				  op->strblt.dst_x1, op->strblt.dst_y1,
+				  op->strblt.fliprot.rotation);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int mstar_ge_test_pretest(struct mstar_ge *ge,
 		struct mstar_ge_job *j,
 		const struct mstar_ge_buf *src,
 		const struct mstar_ge_buf *dst)
 {
+	mstar_ge_validate_op(ge, &j->opdata, 0);
+
 	dev_info(ge->dev, "src before\n");
 	mstar_ge_asciiart(src->buf, src->cfg.width, src->cfg.height);
 	dev_info(ge->dev, "dst before\n");
@@ -1047,7 +1129,7 @@ static int mstar_ge_test(struct mstar_ge *ge)
 	j->opdata.bitblt.dst_y0 = 1;
 	j->opdata.bitblt.dst_x1 = 3;
 	j->opdata.bitblt.dst_y1 = 3;
-	j->opdata.bitblt.rotation = MSTAR_GE_ROTATION_0;
+	j->opdata.bitblt.fliprot.rotation = MSTAR_GE_ROTATION_0;
 
 	mstar_ge_filltestbuf(&src);
 	mstar_ge_cleartestbuf(&dst);
@@ -1064,7 +1146,7 @@ static int mstar_ge_test(struct mstar_ge *ge)
 	/* bitblt, 90 rotation */
 	dev_info(ge->dev, "Test, bitblt, rotation 90\n");
 	mstar_ge_reset_job(j);
-	j->opdata.bitblt.rotation = MSTAR_GE_ROTATION_90;
+	j->opdata.bitblt.fliprot.rotation = MSTAR_GE_ROTATION_90;
 
 	mstar_ge_filltestbuf(&src);
 	mstar_ge_cleartestbuf(&dst);
@@ -1079,7 +1161,7 @@ static int mstar_ge_test(struct mstar_ge *ge)
 	/* bitblt, 180 rotation */
 	dev_info(ge->dev, "Test, bitblt, rotation 180\n");
 	mstar_ge_reset_job(j);
-	j->opdata.bitblt.rotation = MSTAR_GE_ROTATION_180;
+	j->opdata.bitblt.fliprot.rotation = MSTAR_GE_ROTATION_180;
 
 	mstar_ge_filltestbuf(&src);
 	mstar_ge_cleartestbuf(&dst);
@@ -1094,7 +1176,7 @@ static int mstar_ge_test(struct mstar_ge *ge)
 	/* bitblt, 270 rotation */
 	dev_info(ge->dev, "Test, bitblt, rotation 270\n");
 	mstar_ge_reset_job(j);
-	j->opdata.bitblt.rotation = MSTAR_GE_ROTATION_270;
+	j->opdata.bitblt.fliprot.rotation = MSTAR_GE_ROTATION_270;
 
 	mstar_ge_filltestbuf(&src);
 	mstar_ge_cleartestbuf(&dst);
@@ -1120,7 +1202,7 @@ test_strblt:
 	j->opdata.strblt.dst_x1 = (dst.cfg.width / 2) - 1;
 	j->opdata.strblt.dst_y1 = (dst.cfg.height / 2) - 1;
 	//
-	j->opdata.strblt.rotation = MSTAR_GE_ROTATION_0;
+	j->opdata.strblt.fliprot.rotation = MSTAR_GE_ROTATION_0;
 
 	mstar_ge_filltestbuf(&src);
 	mstar_ge_cleartestbuf(&dst);
@@ -1152,42 +1234,7 @@ static int mstar_ge_validate_buffer(struct mstar_ge *ge, struct mstar_ge_buf *bu
 		return -EINVAL;
 
 	if (mstar_ge_drm_color_to_gop(buf->cfg.fourcc) < 0) {
-		dev_warn(ge->dev, "Unhandled buffer type\n");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int mstar_ge_validate_op(struct mstar_ge *ge, struct mstar_ge_opdata *op, int number)
-{
-	/* Check the operation isn't garbage */
-	switch (op->op) {
-	case MSTAR_GE_OP_LINE:
-		dev_dbg(ge->dev, "op %d: LINE\n", number);
-		break;
-	case MSTAR_GE_OP_RECTFILL:
-		dev_dbg(ge->dev, "op %d: RECTFILL, %d:%d -> %d:%d\n",
-				number,
-				op->rectfill.x0, op->rectfill.y0,
-				op->rectfill.x1, op->rectfill.y1);
-		break;
-	case MSTAR_GE_OP_BITBLT:
-		dev_dbg(ge->dev, "op %d: BITBLT %d,%d -> %d:%d,%d,%d (rot %d)\n", number,
-				op->bitblt.src_x0, op->bitblt.src_y0,
-				op->bitblt.dst_x0, op->bitblt.dst_y0,
-				op->bitblt.dst_x1, op->bitblt.dst_y1,
-				op->bitblt.rotation);
-		break;
-	case MSTAR_GE_OP_STRBLT:
-		dev_dbg(ge->dev, "op %d: STRBLT %d,%d,%d,%d -> %d:%d,%d,%d (rot %d)\n", number,
-				  op->strblt.src_x0, op->strblt.src_y0,
-				  op->strblt.src_x1, op->strblt.src_y1,
-				  op->strblt.dst_x0, op->strblt.dst_y0,
-				  op->strblt.dst_x1, op->strblt.dst_y1,
-				  op->strblt.rotation);
-		break;
-	default:
+		dev_warn(ge->dev, "Unhandled buffer type: %p4cc\n", &buf->cfg.fourcc);
 		return -EINVAL;
 	}
 
@@ -1467,7 +1514,9 @@ static int mstar_ge_probe(struct platform_device *pdev)
 
 	ge->rot = devm_regmap_field_alloc(dev, regmap, rot_field);
 	ge->prim_type = devm_regmap_field_alloc(dev, regmap, prim_type_field);
+	ge->pri_s_y_dir = devm_regmap_field_alloc(dev, regmap, pri_s_y_dir_field);
 	ge->pri_x_dir = devm_regmap_field_alloc(dev, regmap, pri_x_dir_field);
+	ge->pri_y_dir = devm_regmap_field_alloc(dev, regmap, pri_y_dir_field);
 
 	/* Line controls */
 	ge->line_delta = devm_regmap_field_alloc(dev, regmap, line_delta_field);
